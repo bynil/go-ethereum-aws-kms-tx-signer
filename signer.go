@@ -191,3 +191,61 @@ func adjustSignatureLength(buffer []byte) []byte {
 	}
 	return buffer
 }
+
+type Key struct {
+	Address common.Address
+	PubKey  []byte
+	svc     *kms.Client
+	keyId   string
+}
+
+func NewAwsKmsKey(ctx context.Context, svc *kms.Client, keyId string) (*Key, error) {
+	pubKey, err := GetPubKeyCtx(ctx, svc, keyId)
+	if err != nil {
+		return nil, err
+	}
+
+	pubKeyBytes := secp256k1.S256().Marshal(pubKey.X, pubKey.Y)
+	keyAddr := crypto.PubkeyToAddress(*pubKey)
+	key := &Key{
+		Address: keyAddr,
+		PubKey:  pubKeyBytes,
+		svc:     svc,
+		keyId:   keyId,
+	}
+	return key, nil
+}
+
+func (key *Key) Sign(ctx context.Context, hash []byte) ([]byte, error) {
+	if len(hash) != crypto.DigestLength {
+		return nil, errors.Errorf("hash is required to be exactly %d bytes (%d)", crypto.DigestLength, len(hash))
+	}
+	rBytes, sBytes, err := getSignatureFromKms(ctx, key.svc, key.keyId, hash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Adjust S value from signature according to Ethereum standard
+	sBigInt := new(big.Int).SetBytes(sBytes)
+	if sBigInt.Cmp(secp256k1HalfN) > 0 {
+		sBytes = new(big.Int).Sub(secp256k1N, sBigInt).Bytes()
+	}
+
+	return getEthereumSignature(key.PubKey, hash, rBytes, sBytes)
+}
+
+func (key *Key) SignTransaction(ctx context.Context, address common.Address, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
+	if chainID == nil {
+		return nil, bind.ErrNoChainID
+	}
+	signer := types.LatestSignerForChainID(chainID)
+	if address != key.Address {
+		return nil, bind.ErrNotAuthorized
+	}
+	txHashBytes := signer.Hash(tx).Bytes()
+	signature, err := key.Sign(ctx, txHashBytes)
+	if err != nil {
+		return nil, err
+	}
+	return tx.WithSignature(signer, signature)
+}
